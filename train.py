@@ -522,7 +522,7 @@ class Trainer:
                         output, _ = model_rollout(
                             self.model,
                             inp,
-                            predict_normed=False,
+                            predict_normed=True,
                             n_future_steps=min(self.params.val_rollout, tar.shape[1]),
                             state_labels=state_labels[0],
                             dset_name=dset_name,
