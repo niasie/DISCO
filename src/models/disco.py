@@ -1,5 +1,6 @@
-"""DISCO: train a hypernetwork (hpnn) to output the operator network (opnn) 
+"""DISCO: train a hypernetwork (hpnn) to output the operator network (opnn)
 which is then evolved to solve the PDE."""
+
 from typing import List, Dict
 import numpy as np
 import torch
@@ -10,7 +11,8 @@ from torch import Tensor
 from torch.nn.utils import parameters_to_vector
 from torch._functorch.apis import vmap
 from torch._functorch.functional_call import functional_call
-from src.torchdiffeq import odeint_adjoint
+from einops.layers.torch import Rearrange
+from src.torchdiffeq import odeint_adjoint, find_parameters
 
 from src.models.attention import SpaceTimeBlock, RMSGroupNorm
 from src.utils import standardize
@@ -21,50 +23,87 @@ def make_conv(
     dim: int, c_in: int, c_out: int, ksize: int, stride: int, padding: int, padding_mode: str, groups: int
 ) -> nn.Module:
     if dim == 1:
-        return nn.Conv1d(c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, padding_mode=padding_mode, groups=groups, bias=False)
+        return nn.Conv1d(
+            c_in,
+            c_out,
+            kernel_size=ksize,
+            stride=stride,
+            padding=padding,
+            padding_mode=padding_mode,
+            groups=groups,
+            bias=False,
+        )
     elif dim == 2:
-        return nn.Conv2d(c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, padding_mode=padding_mode, groups=groups, bias=False)
+        return nn.Conv2d(
+            c_in,
+            c_out,
+            kernel_size=ksize,
+            stride=stride,
+            padding=padding,
+            padding_mode=padding_mode,
+            groups=groups,
+            bias=False,
+        )
     elif dim == 3:
-        return nn.Conv3d(c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, padding_mode=padding_mode, groups=groups, bias=False)
+        return nn.Conv3d(
+            c_in,
+            c_out,
+            kernel_size=ksize,
+            stride=stride,
+            padding=padding,
+            padding_mode=padding_mode,
+            groups=groups,
+            bias=False,
+        )
     else:
         raise ValueError(f"Unsupported dim={dim}")
-    
+
 
 def make_conv_transpose(
     dim: int, c_in: int, c_out: int, ksize: int, stride: int, padding: int, groups: int
 ) -> nn.Module:
     if dim == 1:
-        return nn.ConvTranspose1d(c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, groups=groups, bias=False)
+        return nn.ConvTranspose1d(
+            c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, groups=groups, bias=False
+        )
     elif dim == 2:
-        return nn.ConvTranspose2d(c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, groups=groups, bias=False)
+        return nn.ConvTranspose2d(
+            c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, groups=groups, bias=False
+        )
     elif dim == 3:
-        return nn.ConvTranspose3d(c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, groups=groups, bias=False)
+        return nn.ConvTranspose3d(
+            c_in, c_out, kernel_size=ksize, stride=stride, padding=padding, groups=groups, bias=False
+        )
     else:
         raise ValueError(f"Unsupported dim={dim}")
 
+
 # ========= Hypernetwork (hpnn) =========
+
 
 class SubsampledInLinear(nn.Module):
     """A linear layer with varying input channels but same output channels."""
+
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
         self.linear = nn.Linear(dim_in, dim_out)
-    
+
     def forward(self, x: Tensor, labels: Tensor) -> Tensor:
         dim_in = self.linear.in_features
         label_size = len(labels)
         weight, bias = self.linear.weight, self.linear.bias
-        scale = torch.tensor((dim_in / label_size) ** .5, dtype=x.dtype, device=x.device)
+        scale = torch.tensor((dim_in / label_size) ** 0.5, dtype=x.dtype, device=x.device)
         x = scale * F.linear(x, weight[:, labels], bias)
         return x
-    
+
 
 class SubsampledOutLinear(nn.Module):
-    """ A linear layer with varying output channels but same input channels."""
+    """A linear layer with varying output channels but same input channels."""
+
     def __init__(self, dim_in: int, dim_out: int):
         super().__init__()
         self.linear = nn.Linear(dim_in, dim_out)
-    
+
     def forward(self, x: Tensor, labels: Tensor) -> Tensor:
         weight, bias = self.linear.weight, self.linear.bias
         x = F.linear(x, weight[labels, :], bias[labels])
@@ -73,41 +112,67 @@ class SubsampledOutLinear(nn.Module):
 
 class Encoder(nn.Module):
     """A standard CNN encoder."""
-    def __init__(self, 
-        patch_size: int,
-        embed_dim: int, 
-        spatial_ndims: int, 
-        padding_mode: str, 
-        groups: int
-    ):
+
+    def __init__(self, patch_size: int, embed_dim: int, spatial_ndims: int, padding_mode: str, groups: int):
         super().__init__()
         if patch_size not in [8, 16]:
             raise ValueError("Patch size must be one of 8, 16")
         ksize = patch_size // 4  # Will be 2 or 4
-        self.encoder = nn.Sequential(*[
-            make_conv(spatial_ndims, embed_dim//4, embed_dim//4, ksize=ksize, stride=ksize, padding=0, padding_mode=padding_mode, groups=1),
-            RMSGroupNorm(groups, embed_dim//4, affine=True),
-            nn.GELU(),
-            make_conv(spatial_ndims, embed_dim//4, embed_dim//4, ksize=2, stride=2, padding=0, padding_mode=padding_mode, groups=1),
-            RMSGroupNorm(groups, embed_dim//4, affine=True),
-            nn.GELU(),
-            make_conv(spatial_ndims, embed_dim//4, embed_dim, ksize=2, stride=2, padding=0, padding_mode=padding_mode, groups=1),
-            RMSGroupNorm(groups, embed_dim, affine=True),
-        ])
-    
+        self.encoder = nn.Sequential(
+            *[
+                make_conv(
+                    spatial_ndims,
+                    embed_dim // 4,
+                    embed_dim // 4,
+                    ksize=ksize,
+                    stride=ksize,
+                    padding=0,
+                    padding_mode=padding_mode,
+                    groups=1,
+                ),
+                RMSGroupNorm(groups, embed_dim // 4, affine=True),
+                nn.GELU(),
+                make_conv(
+                    spatial_ndims,
+                    embed_dim // 4,
+                    embed_dim // 4,
+                    ksize=2,
+                    stride=2,
+                    padding=0,
+                    padding_mode=padding_mode,
+                    groups=1,
+                ),
+                RMSGroupNorm(groups, embed_dim // 4, affine=True),
+                nn.GELU(),
+                make_conv(
+                    spatial_ndims,
+                    embed_dim // 4,
+                    embed_dim,
+                    ksize=2,
+                    stride=2,
+                    padding=0,
+                    padding_mode=padding_mode,
+                    groups=1,
+                ),
+                RMSGroupNorm(groups, embed_dim, affine=True),
+            ]
+        )
+
     def forward(self, x: Tensor) -> Tensor:
         return self.encoder(x)
 
 
 class Hypernetwork(nn.Module):
     """A hypernetwork that outputs the operator network latent representation.
-    It projects the input (a short trajectory) into a low-dimensional space 
+    It projects the input (a short trajectory) into a low-dimensional space
     (the operator space)."""
-    def __init__(self, 
+
+    def __init__(
+        self,
         patch_size: int,
         n_states: int,
-        ndims: List[int], 
-        embed_dim: int, 
+        ndims: List[int],
+        embed_dim: int,
         groups: int,
         processor_blocks: int,
         drop_path: float,
@@ -117,41 +182,39 @@ class Hypernetwork(nn.Module):
         super().__init__()
 
         # Adapters to varying number of input channels (e.g. pressure, velocity ...)
-        self.adapter = SubsampledInLinear(dim_in=n_states, dim_out=embed_dim//4)
+        self.adapter = SubsampledInLinear(dim_in=n_states, dim_out=embed_dim // 4)
 
         # Encoder (one for each 1d, 2d, 3d)
-        self.encoder = nn.ModuleDict({
-            str(ndim): Encoder(patch_size, embed_dim, ndim, "reflect", groups)
-            for ndim in ndims
-        })
+        self.encoder = nn.ModuleDict(
+            {str(ndim): Encoder(patch_size, embed_dim, ndim, "reflect", groups) for ndim in ndims}
+        )
 
         # Processor (attention layers common to all trajectories)
         self.dp = np.linspace(0, drop_path, processor_blocks)
-        self.blocks = nn.ModuleList([
-            SpaceTimeBlock(dim=embed_dim, num_heads=num_heads, bias_type=bias_type, drop_path=dp)
-            for dp in self.dp
-        ])
+        self.blocks = nn.ModuleList(
+            [SpaceTimeBlock(dim=embed_dim, num_heads=num_heads, bias_type=bias_type, drop_path=dp) for dp in self.dp]
+        )
 
     def forward(self, x: Tensor, state_labels: Tensor) -> Tensor:
-        """ x is B T C H (W) (D) """
+        """x is B T C H (W) (D)"""
         # Dimensions
         B = x.shape[0]
         spatial_ndims = x.ndim - 3
-        spatial_dims = tuple(range(3,x.ndim))
+        spatial_dims = tuple(range(3, x.ndim))
         x = x[(...,) + (None,) * (6 - x.ndim)]  # now x is B T C H W D
 
         # Preprocess
-        x = standardize(x, dims=(1,*spatial_dims), return_stats=False)
+        x = standardize(x, dims=(1, *spatial_dims), return_stats=False)
 
         # Adapt varying input channels to a fixed number
-        x = rearrange(x, 'b t c ... -> (b t) ... c')
+        x = rearrange(x, "b t c ... -> (b t) ... c")
         x = self.adapter(x, state_labels)
-        x = rearrange(x, 'bt ... c -> bt c ...')
+        x = rearrange(x, "bt ... c -> bt c ...")
 
         # Encode
-        x = x.squeeze((-2,-1))
+        x = x.squeeze((-2, -1))
         x = self.encoder[str(spatial_ndims)](x)
-        x = rearrange(x, '(b t) c ... ->  b t c ...', b=B)
+        x = rearrange(x, "(b t) c ... ->  b t c ...", b=B)
 
         # Attention layers
         all_att_maps = []
@@ -161,24 +224,32 @@ class Hypernetwork(nn.Module):
 
         return x
 
+
 # ========= Operator network (opnn) =========
+
 
 class Down(nn.Module):
     """A downsampling block."""
-    def __init__(self, 
-        dim: int, 
-        in_channels: int, 
+
+    def __init__(
+        self,
+        dim: int,
+        in_channels: int,
         mid_channels: int,
-        out_channels: int, 
+        out_channels: int,
         groups: int,
         norm_groups: int,
         padding_mode: str,
     ):
         super().__init__()
-        self.conv1 = make_conv(dim, in_channels, mid_channels, ksize=2, stride=2, padding=0, padding_mode=padding_mode, groups=1)
+        self.conv1 = make_conv(
+            dim, in_channels, mid_channels, ksize=2, stride=2, padding=0, padding_mode=padding_mode, groups=1
+        )
         self.norm1 = nn.GroupNorm(norm_groups, mid_channels, affine=False)
         self.gelu1 = nn.GELU()
-        self.conv2 = make_conv(dim, mid_channels, out_channels, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=groups)
+        self.conv2 = make_conv(
+            dim, mid_channels, out_channels, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=groups
+        )
         self.norm2 = nn.GroupNorm(norm_groups, out_channels, affine=False)
         self.gelu2 = nn.GELU()
 
@@ -194,19 +265,23 @@ class Down(nn.Module):
 
 class Up(nn.Module):
     """An upsampling block."""
-    def __init__(self, 
-        dim: int, 
-        in_channels: int, 
-        out_channels: int, 
+
+    def __init__(
+        self,
+        dim: int,
+        in_channels: int,
+        out_channels: int,
         groups: int,
         norm_groups: int,
         padding_mode: str,
     ):
         super().__init__()
-        self.up = make_conv_transpose(dim, in_channels, in_channels//2, ksize=2, stride=2, padding=0, groups=1)
-        self.norm = nn.GroupNorm(norm_groups, in_channels//2, affine=False)
+        self.up = make_conv_transpose(dim, in_channels, in_channels // 2, ksize=2, stride=2, padding=0, groups=1)
+        self.norm = nn.GroupNorm(norm_groups, in_channels // 2, affine=False)
         self.gelu = nn.GELU()
-        self.conv = make_conv(dim, in_channels, out_channels, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=groups)
+        self.conv = make_conv(
+            dim, in_channels, out_channels, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=groups
+        )
 
     def forward(self, x1: Tensor, x2: Tensor) -> Tensor:
         x = self.up(x1)
@@ -222,11 +297,11 @@ def create_frontier_mask(x: Tensor) -> Tensor:
     Assumes shape = (B, *spatial)."""
     ndim = x.ndim - 1
     mask = torch.zeros_like(x)
-    
+
     for dim in range(ndim):
         slice_down = [...] + [0 if i == dim else slice(None) for i in range(ndim)]
         slice_up = [...] + [-1 if i == dim else slice(None) for i in range(ndim)]
-        
+
         mask[tuple(slice_down)] = 1
         mask[tuple(slice_up)] = 1
 
@@ -235,6 +310,7 @@ def create_frontier_mask(x: Tensor) -> Tensor:
 
 class OperatorNetwork(nn.Module):
     """A standard U-Net architecture."""
+
     def __init__(self, in_channels, start, spatial_ndims, boundary_conditions, norm_groups, num_heads=0):
         super().__init__()
         self.in_channels = in_channels
@@ -244,50 +320,128 @@ class OperatorNetwork(nn.Module):
         self.norm_groups = norm_groups
         self.num_heads = num_heads
 
-        if boundary_conditions == 'periodic':
-            padding_mode = 'circular'
+        if boundary_conditions == "periodic":
+            padding_mode = "circular"
         else:
-            padding_mode = 'reflect'
-        self.add_mask = boundary_conditions != 'periodic'
+            padding_mode = "reflect"
+        self.add_mask = boundary_conditions != "periodic"
         bc_offset = int(self.add_mask)
 
-        # Layers 
-        self.adapter_in = make_conv(spatial_ndims, in_channels+bc_offset, start, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=1)
+        # Layers
+        self.adapter_in = make_conv(
+            spatial_ndims,
+            in_channels + bc_offset,
+            start,
+            ksize=3,
+            stride=1,
+            padding=1,
+            padding_mode=padding_mode,
+            groups=1,
+        )
         self.conv_in = nn.Sequential(
             make_conv(spatial_ndims, start, start, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=1),
             nn.GroupNorm(norm_groups, start, affine=False),
             nn.GELU(),
         )
-        self.downs = nn.ModuleList([
-            Down(spatial_ndims, start * 1, start * 2, start * 2, norm_groups=norm_groups, padding_mode=padding_mode, groups=start*2),
-            Down(spatial_ndims, start * 2, start * 4, start * 4, norm_groups=norm_groups, padding_mode=padding_mode, groups=start*4),
-            Down(spatial_ndims, start * 4, start * 8, start * 8, norm_groups=norm_groups, padding_mode=padding_mode, groups=start*8),
-            Down(spatial_ndims, start * 8, start * 16, start * 16, norm_groups=norm_groups, padding_mode=padding_mode, groups=start*16),
-        ])  
-        self.ups = nn.ModuleList([
-            Up(spatial_ndims, start * 16, start * 8, norm_groups=norm_groups, padding_mode=padding_mode, groups=start*8),
-            Up(spatial_ndims, start * 8, start * 4, norm_groups=norm_groups, padding_mode=padding_mode, groups=start*4),
-            Up(spatial_ndims, start * 4, start * 2, norm_groups=norm_groups, padding_mode=padding_mode, groups=start*2),
-            Up(spatial_ndims, start * 2, start * 1, norm_groups=norm_groups, padding_mode=padding_mode, groups=start*1),
-        ])
+        self.downs = nn.ModuleList(
+            [
+                Down(
+                    spatial_ndims,
+                    start * 1,
+                    start * 2,
+                    start * 2,
+                    norm_groups=norm_groups,
+                    padding_mode=padding_mode,
+                    groups=start * 2,
+                ),
+                Down(
+                    spatial_ndims,
+                    start * 2,
+                    start * 4,
+                    start * 4,
+                    norm_groups=norm_groups,
+                    padding_mode=padding_mode,
+                    groups=start * 4,
+                ),
+                Down(
+                    spatial_ndims,
+                    start * 4,
+                    start * 8,
+                    start * 8,
+                    norm_groups=norm_groups,
+                    padding_mode=padding_mode,
+                    groups=start * 8,
+                ),
+                Down(
+                    spatial_ndims,
+                    start * 8,
+                    start * 16,
+                    start * 16,
+                    norm_groups=norm_groups,
+                    padding_mode=padding_mode,
+                    groups=start * 16,
+                ),
+            ]
+        )
+        self.ups = nn.ModuleList(
+            [
+                Up(
+                    spatial_ndims,
+                    start * 16,
+                    start * 8,
+                    norm_groups=norm_groups,
+                    padding_mode=padding_mode,
+                    groups=start * 8,
+                ),
+                Up(
+                    spatial_ndims,
+                    start * 8,
+                    start * 4,
+                    norm_groups=norm_groups,
+                    padding_mode=padding_mode,
+                    groups=start * 4,
+                ),
+                Up(
+                    spatial_ndims,
+                    start * 4,
+                    start * 2,
+                    norm_groups=norm_groups,
+                    padding_mode=padding_mode,
+                    groups=start * 2,
+                ),
+                Up(
+                    spatial_ndims,
+                    start * 2,
+                    start * 1,
+                    norm_groups=norm_groups,
+                    padding_mode=padding_mode,
+                    groups=start * 1,
+                ),
+            ]
+        )
         self.bottleneck = nn.Sequential(
-            make_conv(spatial_ndims, start * 16, start * 32, ksize=1, stride=1, padding=0, padding_mode=padding_mode, groups=1),
+            make_conv(
+                spatial_ndims, start * 16, start * 32, ksize=1, stride=1, padding=0, padding_mode=padding_mode, groups=1
+            ),
             nn.GroupNorm(norm_groups, start * 32, affine=False),
             nn.GELU(),
-            make_conv(spatial_ndims, start * 32, start * 16, ksize=1, stride=1, padding=0, padding_mode=padding_mode, groups=1),
+            make_conv(
+                spatial_ndims, start * 32, start * 16, ksize=1, stride=1, padding=0, padding_mode=padding_mode, groups=1
+            ),
         )
         self.convs_out = nn.Sequential(
             make_conv(spatial_ndims, start, start, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=1),
             nn.GroupNorm(norm_groups, start, affine=False),
             nn.GELU(),
         )
-        self.adapter_out = make_conv(spatial_ndims, start, in_channels, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=1)
+        self.adapter_out = make_conv(
+            spatial_ndims, start, in_channels, ksize=3, stride=1, padding=1, padding_mode=padding_mode, groups=1
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-
         # Deal with boundary conditions
         if self.add_mask:
-            mask = create_frontier_mask(x[:,0,...]).unsqueeze(1)
+            mask = create_frontier_mask(x[:, 0, ...]).unsqueeze(1)
             x = torch.cat([x, mask], dim=1)
 
         # Adapt to varying number of channels
@@ -295,14 +449,14 @@ class OperatorNetwork(nn.Module):
 
         # First conv
         x1 = self.conv_in(x)
-        
+
         # Downsampling
         x2 = self.downs[0](x1)
         x3 = self.downs[1](x2)
         x4 = self.downs[2](x3)
         x5 = self.downs[3](x4)
 
-        # Bottleneck 
+        # Bottleneck
         x5 = x5 + self.bottleneck(x5)
 
         # Upsampling
@@ -317,7 +471,9 @@ class OperatorNetwork(nn.Module):
 
         return x
 
+
 # ========= DISCO =========
+
 
 def vectors_to_parameters(vec: Tensor, parameters_dict: Dict) -> Dict:
     """Slice a vector into parameters given by a dictionary of parameters."""
@@ -347,7 +503,9 @@ def functional_call_batched(model: nn.Module, parameter_vec_batch: Tensor, x_bat
 class DISCO(nn.Module):
     """DISCO model: a hypernetwork that outputs the weights of an operator network,
     which is then evolved via neuralPDE to predict the next state."""
-    def __init__(self, 
+
+    def __init__(
+        self,
         n_states: int,
         hidden_dim: int,
         patch_size: int,
@@ -365,21 +523,27 @@ class DISCO(nn.Module):
         integration_library: str = "torchdiffeq",
     ):
         super().__init__()
-        
+
         # Operator network (opnn): network evolved via neuralPDE solver
-        self.opnns = nn.ModuleDict({
-            dname: OperatorNetwork(
-                in_channels=DATASET_SPECS[dname]['in_channels'], 
-                start=8, 
-                spatial_ndims=DATASET_SPECS[dname]['spatial_ndims'],
-                boundary_conditions=DATASET_SPECS[dname]['boundary_conditions'], 
-                norm_groups=4
-            )
-            for dname in dataset_names
-        })
-        self.numel_opnn_parameters = {dname: parameters_to_vector(self.opnns[dname].parameters()).numel() for dname in dataset_names}
-        self.param_masks = self.make_weights_masks()  # masks indicating which weights are adimensional, dimensional, or varying-channels
-        
+        self.opnns = nn.ModuleDict(
+            {
+                dname: OperatorNetwork(
+                    in_channels=DATASET_SPECS[dname]["in_channels"],
+                    start=8,
+                    spatial_ndims=DATASET_SPECS[dname]["spatial_ndims"],
+                    boundary_conditions=DATASET_SPECS[dname]["boundary_conditions"],
+                    norm_groups=4,
+                )
+                for dname in dataset_names
+            }
+        )
+        self.numel_opnn_parameters = {
+            dname: parameters_to_vector(self.opnns[dname].parameters()).numel() for dname in dataset_names
+        }
+        self.param_masks = (
+            self.make_weights_masks()
+        )  # masks indicating which weights are adimensional, dimensional, or varying-channels
+
         # Solver specifics (neuralPDE)
         self.max_steps = max_steps
         self.atol = atol
@@ -402,18 +566,24 @@ class DISCO(nn.Module):
         # Parameter generator: generate the weights of the operator network from its predicted latent representation
         param_counts = {
             dname: {
-                'adim': (self.param_masks[dname] == 0).sum().item(),  # weights that don't vary in shape with different inputs (e.g. fully connected layers)
-                'dim': (self.param_masks[dname] == 1).sum().item(),  # weights that vary in the spatial dimension of the input (e.g. conv layers)
-                'varying_channels': (self.param_masks[dname] == 2).sum().item(),  # weights that vary in the input channels (adapter in and out conv layers)
+                "adim": (self.param_masks[dname] == 0)
+                .sum()
+                .item(),  # weights that don't vary in shape with different inputs (e.g. fully connected layers)
+                "dim": (self.param_masks[dname] == 1)
+                .sum()
+                .item(),  # weights that vary in the spatial dimension of the input (e.g. conv layers)
+                "varying_channels": (self.param_masks[dname] == 2)
+                .sum()
+                .item(),  # weights that vary in the input channels (adapter in and out conv layers)
             }
             for dname in dataset_names
         }
         count_dim = {}
         for dname in dataset_names:
-            dim = DATASET_SPECS[dname]['spatial_ndims']
-            count_adim = param_counts[dname]['adim']
+            dim = DATASET_SPECS[dname]["spatial_ndims"]
+            count_adim = param_counts[dname]["adim"]
             if dim not in count_dim:
-                count_dim[str(dim)] = param_counts[dname]['dim']
+                count_dim[str(dim)] = param_counts[dname]["dim"]
         self.param_gen_common = nn.Sequential(
             nn.Linear(hidden_dim, hpnn_head_hidden_dim),
             nn.GELU(),
@@ -421,20 +591,18 @@ class DISCO(nn.Module):
             nn.GELU(),
         )
         self.param_gen_adim = nn.Linear(hpnn_head_hidden_dim, count_adim)
-        self.param_gen_dim = nn.ModuleDict({
-            dim: nn.Linear(hpnn_head_hidden_dim, numel)
-            for (dim, numel) in count_dim.items()
-        })
-        self.param_gen_channels = nn.ModuleDict({
-            dname: nn.Linear(hpnn_head_hidden_dim, param_counts[dname]['varying_channels'])
-            for dname in dataset_names
-        })
+        self.param_gen_dim = nn.ModuleDict(
+            {dim: nn.Linear(hpnn_head_hidden_dim, numel) for (dim, numel) in count_dim.items()}
+        )
+        self.param_gen_channels = nn.ModuleDict(
+            {dname: nn.Linear(hpnn_head_hidden_dim, param_counts[dname]["varying_channels"]) for dname in dataset_names}
+        )
         theta_norms = self.init_normalizations()  # normalization to apply to predicted weights
         for k, norm in theta_norms.items():
             self.register_buffer(f"theta_norm_{k}", norm)
 
     def init_normalizations(self) -> Dict[str, Tensor]:
-        """ Determine the normalizations of the opnns. """
+        """Determine the normalizations of the opnns."""
         norms = {}
         for k, opnn in self.opnns.items():
             params = dict(opnn.named_parameters())
@@ -442,7 +610,7 @@ class DISCO(nn.Module):
             norm = parameters_to_vector(params_max.values())
             norms[k] = norm
         return norms
-    
+
     def make_weights_masks(self) -> Dict[str, Tensor]:
         """Obtain the 'type' of each weight in the operator network.
         The type is either:
@@ -457,34 +625,35 @@ class DISCO(nn.Module):
             for i_layer, (k, v) in enumerate(params.items()):
                 if v.shape[-1] == 1:  # indicates 1x1 convolution, so fully connected
                     mask_this_name[k].fill_(0)
-                if i_layer == 0 or i_layer == len(params)-1:
+                if i_layer == 0 or i_layer == len(params) - 1:
                     mask_this_name[k].fill_(2)
             mask_this_name = parameters_to_vector(mask_this_name.values())
             masks[name] = mask_this_name
         return masks
-        
-    def forward(self, 
-        x: Tensor, 
-        state_labels: Tensor, 
-        dset_name: str, 
+
+    def forward(
+        self,
+        x: Tensor,
+        state_labels: Tensor,
+        dset_name: str,
         predict_normed: bool = False,
     ) -> Tensor:
-        """ x is B T C H (W) (D) """
+        """x is B T C H (W) (D)"""
         B, _, _, *spatial = x.shape
         dim = len(spatial)
         state_labels = state_labels.unsqueeze(0).repeat(B, 1)
 
         # Preprocess
-        spatial_dims = tuple(range(3,x.ndim))
-        x, mean, std = standardize(x, dims=(1,*spatial_dims), return_stats=True)  # b t c h w
-        metadata = {'mean': mean, 'std': std}
+        spatial_dims = tuple(range(3, x.ndim))
+        x, mean, std = standardize(x, dims=(1, *spatial_dims), return_stats=True)  # b t c h w
+        metadata = {"mean": mean, "std": std}
 
         # Keep as initial state for the solver later
-        x_input = x[:,-1,...]
+        x_input = x[:, -1, ...]
 
         # Estimate the operator latent parameters -> enforece a bottleneck on estimating the dynamics
         theta_latent = self.hpnn(x, state_labels[0])
-        theta_latent = theta_latent.mean((1,3,4,5))  # average on time x space
+        theta_latent = theta_latent.mean((1, 3, 4, 5))  # average on time x space
 
         # Generate the operator parameters
         theta = self.param_gen_common(theta_latent)
@@ -498,8 +667,10 @@ class DISCO(nn.Module):
 
         # Normalize weights per layer accounting for the size of each layer
         theta_norm = getattr(self, f"theta_norm_{dset_name}")
+
         def signed_sigmoid(x, factor=2.0):
             return factor * (2 * torch.sigmoid(2 * x / factor) - 1)
+
         theta = theta * theta_norm / theta_norm.pow(2.0).mean().pow(0.5)
         theta = theta_norm * signed_sigmoid(theta / theta_norm)
 
@@ -512,19 +683,112 @@ class DISCO(nn.Module):
             x = x.unsqueeze(1)
             x = functional_call_batched(self.opnns[dset_name], theta, x)
             return x.squeeze(1)
-        options = {'min_step': 1/self.max_steps}
+
+        options = {"min_step": 1 / self.max_steps}
         t = torch.linspace(0, 1, 2, device=x.device)
-        n_steps, x = odeint_adjoint(opnn, x_input, t=t, rtol=self.rtol, method="bosh3", options=options, adjoint_params=(theta,))
+        n_steps, x = odeint_adjoint(
+            opnn, x_input, t=t, rtol=self.rtol, method="bosh3", options=options, adjoint_params=(theta,)
+        )
 
         # Post-process
-        x = x[-1,...]
+        x = x[-1, ...]
         x = x * std_t + mean_t
         x = x.unsqueeze(1)
 
         if predict_normed:
-            x = x * metadata['std'] + metadata['mean']
+            x = x * metadata["std"] + metadata["mean"]
 
-        metadata['n_steps'] = n_steps
-        metadata['theta'] = theta
+        metadata["n_steps"] = n_steps
+        metadata["theta"] = theta
+
+        return x, metadata
+
+
+class OperatorNetworkSolver(nn.Module):
+    def __init__(
+        self,
+        dataset_names: List[str],
+        max_steps: int = 32,
+        atol: float = 1e-9,
+        rtol: float = 5e-6,
+        integration_library: str = "torchdiffeq",
+    ):
+        super().__init__()
+
+        # Operator network (opnn): network evolved via neuralPDE solver
+        self.opnns = nn.ModuleDict(
+            {
+                dname: OperatorNetwork(
+                    in_channels=DATASET_SPECS[dname]["in_channels"],
+                    start=8,
+                    spatial_ndims=DATASET_SPECS[dname]["spatial_ndims"],
+                    boundary_conditions=DATASET_SPECS[dname]["boundary_conditions"],
+                    norm_groups=4,
+                )
+                for dname in dataset_names
+            }
+        )
+        self.numel_opnn_parameters = {
+            dname: parameters_to_vector(self.opnns[dname].parameters()).numel() for dname in dataset_names
+        }
+
+        # Solver specifics (neuralPDE)
+        self.numel_opnn_parameters = {
+            dname: parameters_to_vector(self.opnns[dname].parameters()).numel() for dname in dataset_names
+        }
+
+        # Solver specifics (neuralPDE)
+        self.max_steps = max_steps
+        self.atol = atol
+        self.rtol = rtol
+        self.integration_library = integration_library
+
+    def forward(
+        self,
+        x: Tensor,
+        state_labels: Tensor,
+        dset_name: str,
+        predict_normed: bool = False,
+    ):
+        """x is B T C H (W) (D)"""
+
+        # Preprocess
+        spatial_dims = tuple(range(3, x.ndim))
+        x, mean, std = standardize(x, dims=(1, *spatial_dims), return_stats=True)  # b t c h w
+        metadata = {"mean": mean, "std": std}
+
+        # Keep as initial state for the solver
+        x_input = x[:, -1, ...]
+
+        # Preprocess last step
+        spatial_dims = tuple(range(2, x_input.ndim))
+        x_input, mean_t, std_t = standardize(x_input, dims=spatial_dims, return_stats=True)  # b c h (w)
+
+        # Solve
+        def opnn(t, x):  # the operator that is integrated by the solver
+            return self.opnns[dset_name](x)
+
+        options = {"min_step": 1 / self.max_steps}
+        t = torch.linspace(0, 1, 2, device=x.device)
+        n_steps, x = odeint_adjoint(
+            opnn,
+            x_input,
+            t=t,
+            rtol=self.rtol,
+            method="bosh3",
+            options=options,
+            adjoint_params=tuple(find_parameters(self.opnns[dset_name])),
+        )
+
+        # Post-process
+        x = x[-1, ...]
+        x = x * std_t + mean_t
+        x = x.unsqueeze(1)
+
+        if predict_normed:
+            x = x * metadata["std"] + metadata["mean"]
+
+        metadata["n_steps"] = n_steps
+        metadata["theta"] = parameters_to_vector(self.opnns[dset_name].parameters())
 
         return x, metadata
