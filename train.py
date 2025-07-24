@@ -567,7 +567,8 @@ class Trainer:
             wandb.init(
                 dir=self.params.experiment_dir,
                 config=self.params,
-                name=self.params.name,
+                # name=self.params.name,
+                name=None,
                 group=self.params.group,
                 project=self.params.project,
                 entity=self.params.entity,
@@ -655,10 +656,10 @@ if __name__ == "__main__":
     params = YParams(CONFIG_PATH / "_base.yaml")
     refined_params = YParams(CONFIG_PATH / args.yaml_config)
     params.update_params(refined_params.params)
-    if is_debug():
-        debug_params = YParams(CONFIG_PATH / "_debug.yaml")
-        params.update_params(debug_params.params)
-    params["debug"] = is_debug()
+    # if is_debug():
+    #     debug_params = YParams(CONFIG_PATH / "_debug.yaml")
+    #     params.update_params(debug_params.params)
+    # params["debug"] = is_debug()
     params["use_ddp"] = args.use_ddp
 
     # Set up distributed training
@@ -670,6 +671,8 @@ if __name__ == "__main__":
     torch.cuda.set_device(local_rank)
 
     device = torch.device(local_rank) if torch.cuda.is_available() else torch.device("cpu")
+
+    print(f"Global rank: {global_rank}, Local rank: {local_rank}, World size: {world_size}")
 
     # Modify params
     params["batch_size"] = int(params.batch_size // world_size)
